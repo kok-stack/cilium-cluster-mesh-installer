@@ -93,11 +93,11 @@ func main() {
 		//编辑cm cilium-config
 		fmt.Printf("[%s]获取configmap\n", name)
 		cmName := "cilium-config"
-		for i := 0; i < 10; i++ {
+		for index := 0; i < 10; i++ {
 			cm, err := client.CoreV1().ConfigMaps(namespace).Get(cmName, v12.GetOptions{})
 			if err != nil {
 				if errors.IsNotFound(err) {
-					fmt.Printf("[%s][%v/10]未找到configmap:%s,等待2s后重试\n", name, i, cmName)
+					fmt.Printf("[%s][%v/10]未找到configmap:%s,等待2s后重试\n", name, index, cmName)
 					time.Sleep(time.Second * 2)
 					continue
 				} else {
@@ -105,7 +105,7 @@ func main() {
 				}
 			}
 			cm.Data["cluster-name"] = name
-			cm.Data["cluster-id"] = strconv.Itoa(i)
+			cm.Data["cluster-id"] = strconv.Itoa(i+1)
 
 			fmt.Printf("[%s]更新configmap\n", name)
 			_, err = client.CoreV1().ConfigMaps(namespace).Update(cm)
@@ -187,9 +187,6 @@ func main() {
 	//合并clustermesh.yaml
 	secret := mergeSecret(clusters)
 	patch := mergePatch(clusters)
-	fmt.Println("patch:======================")
-	//fmt.Println(string(patch))
-	fmt.Println("patch:======================")
 	//在集群循环执行
 	for _, cluster := range clusters {
 		forCluster, err := getClientForCluster(cluster.KubeConfigPath)
@@ -222,6 +219,7 @@ func main() {
 
 		fmt.Printf("[%s]创建secret\n", cluster.Name)
 		//kubectl -n kube-system apply -f clustermesh.yaml
+		//todo:移除自身secret
 		_, err = forCluster.CoreV1().Secrets(namespace).Create(secret)
 		if err != nil {
 			panic(err.Error())
@@ -237,7 +235,7 @@ func main() {
 			panic(err.Error())
 		}
 		for _, item := range ciliumList.Items {
-			fmt.Println()
+			fmt.Println("删除pod",item.Name)
 			_ = forCluster.CoreV1().Pods(namespace).Delete(item.Name, &v12.DeleteOptions{})
 		}
 
@@ -249,6 +247,7 @@ func main() {
 			panic(err.Error())
 		}
 		for _, item := range operatorList.Items {
+			fmt.Println("删除pod",item.Name)
 			_ = forCluster.CoreV1().Pods(namespace).Delete(item.Name, &v12.DeleteOptions{})
 		}
 
