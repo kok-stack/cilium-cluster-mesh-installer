@@ -11,14 +11,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	v12 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 /*
@@ -26,7 +27,7 @@ import (
 */
 const namespace = "kube-system"
 const clusterDir = "/etc/clusters"
-const configName = "config"
+const configName = "kube-config"
 const ciliumDsName = "cilium"
 
 func main() {
@@ -40,6 +41,7 @@ func main() {
 			continue
 		}
 		name := file.Name()
+		fmt.Printf("[%s]开始安装\n", name)
 		kubeconfig := filepath.Join(clusterDir, name, configName)
 		data := &clusterData{
 			KubeConfigPath: kubeconfig,
@@ -48,14 +50,16 @@ func main() {
 		}
 		//heml安装cilium
 		var err error
-		err = ExecCommand(`helm repo add cilium https://helm.cilium.io/ --kubeconfig={{.KubeConfigPath}}`, data)
+		fmt.Printf("[%s]添加helm仓库\n", name)
+		err = ExecCommand(`/usr/local/bin/helm repo add cilium https://helm.cilium.io/ --kubeconfig={{.KubeConfigPath}}`, data)
 		if err != nil {
 			panic(err.Error())
 		}
-		err = ExecCommand(`helm install cilium cilium/cilium --version 1.9.3 \
+		fmt.Printf("[%s]helm 安装 cilium\n", name)
+		err = ExecCommand(`/usr/local/bin/helm install cilium cilium/cilium --version 1.9.3 \
    --namespace kube-system \
    --set etcd.enabled=true \
-   --set etcd.managed=true --kubeconfig={{.KubeConfigPath}}`, data)
+   --set etcd.managed=true --kubeconfig={{.KubeConfigPath}} --replace`, data)
 		if err != nil {
 			panic(err.Error())
 		}
@@ -63,60 +67,112 @@ func main() {
 		if err != nil {
 			panic(err.Error())
 		}
+
+		for i := 0; i < 1000; i++ {
+			ciliumList, _ := client.CoreV1().Pods(namespace).List(v12.ListOptions{
+				LabelSelector: "k8s-app=cilium",
+			})
+			fmt.Printf("[%s][%v/1000]获取pod状态为", name, i)
+			for _, item := range ciliumList.Items {
+				fmt.Print("pod:", item.Name, " ")
+
+				for _, condition := range item.Status.Conditions {
+					ready := condition.Type == v13.PodReady && condition.Status == v13.ConditionTrue
+					fmt.Print(condition.Type, ":", condition.Status, " ready:", ready, " ")
+					if ready {
+						goto label1
+					}
+				}
+			}
+			fmt.Println("")
+			fmt.Printf("[%s][%v/1000]获取pod状态,未ready,等待1s重试\n", name, i)
+			time.Sleep(time.Second)
+		}
+	label1:
+
 		//编辑cm cilium-config
-		cm, err := client.CoreV1().ConfigMaps(namespace).Get("cilium-config", v12.GetOptions{})
-		if err != nil {
-			panic(err.Error())
-		}
-		cm.Data["cluster-name"] = name
-		cm.Data["cluster-id"] = strconv.Itoa(i)
+		fmt.Printf("[%s]获取configmap\n", name)
+		cmName := "cilium-config"
+		for i := 0; i < 10; i++ {
+			cm, err := client.CoreV1().ConfigMaps(namespace).Get(cmName, v12.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					fmt.Printf("[%s][%v/10]未找到configmap:%s,等待2s后重试\n", name, i, cmName)
+					time.Sleep(time.Second * 2)
+					continue
+				} else {
+					panic(err.Error())
+				}
+			}
+			cm.Data["cluster-name"] = name
+			cm.Data["cluster-id"] = strconv.Itoa(i)
 
-		_, err = client.CoreV1().ConfigMaps(namespace).Update(cm)
-		if err != nil {
-			panic(err.Error())
+			fmt.Printf("[%s]更新configmap\n", name)
+			_, err = client.CoreV1().ConfigMaps(namespace).Update(cm)
+			if err != nil {
+				panic(err.Error())
+			}
+			break
 		}
 
-		etcdService := &v13.Service{
-			ObjectMeta: v12.ObjectMeta{
-				Name:      "cilium-etcd-external",
-				Namespace: namespace,
-			},
-			Spec: v13.ServiceSpec{
-				Type: v13.ServiceTypeNodePort,
-				Ports: []v13.ServicePort{
-					{
-						Port: 2379,
+		n := "cilium-etcd-external"
+		_, err = client.CoreV1().Services(namespace).Get(n, v12.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				fmt.Printf("[%s]未找到svc,开始创建\n", name)
+				etcdService := &v13.Service{
+					ObjectMeta: v12.ObjectMeta{
+						Name:      n,
+						Namespace: namespace,
 					},
-				},
-				Selector: map[string]string{
-					"app":           "etcd",
-					"etcd_cluster":  "cilium-etcd",
-					"io.cilium/app": "etcd-operator",
-				},
-			},
+					Spec: v13.ServiceSpec{
+						Type: v13.ServiceTypeNodePort,
+						Ports: []v13.ServicePort{
+							{
+								Port: 2379,
+							},
+						},
+						Selector: map[string]string{
+							"app":           "etcd",
+							"etcd_cluster":  "cilium-etcd",
+							"io.cilium/app": "etcd-operator",
+						},
+					},
+				}
+				//创建svc
+				_, err = client.CoreV1().Services(namespace).Create(etcdService)
+				if err != nil {
+					panic(err.Error())
+				}
+				fmt.Printf("[%s]未找到svc,创建完成\n", name)
+			} else {
+				fmt.Printf("[%s]未找到svc,创建出现错误\n", name)
+				panic(err.Error())
+			}
 		}
-		//创建svc
-		_, err = client.CoreV1().Services(namespace).Create(etcdService)
-		if err != nil {
-			panic(err.Error())
-		}
+
+		fmt.Printf("[%s]执行脚本,获取etcd secret\n", name)
 		//执行./extract-etcd-secrets.sh generate-secret-yaml.sh generate-name-mapping.sh
-		err = ExecCommand(`sh /extract-etcd-secrets.sh`, data)
+		err = ExecCommand(`export KUBECONFIG={{.KubeConfigPath}} && export OUTPUT={{.Dir}}/config && /extract-etcd-secrets.sh`, data)
 		if err != nil {
 			panic(err.Error())
 		}
-		err = ExecCommand(`sh /generate-secret-yaml.sh > clustermesh.yaml`, data)
+		fmt.Printf("[%s]执行脚本,生成yaml\n", name)
+		err = ExecCommand(`export KUBECONFIG={{.KubeConfigPath}} && export OUTPUT={{.Dir}}/config && /generate-secret-yaml.sh > {{.Dir}}/clustermesh.yaml`, data)
 		if err != nil {
 			panic(err.Error())
 		}
-		err = ExecCommand(`sh /generate-name-mapping.sh > ds.patch`, data)
+		fmt.Printf("[%s]执行脚本,生成ds.patch\n", name)
+		err = ExecCommand(`export KUBECONFIG={{.KubeConfigPath}} && export OUTPUT={{.Dir}}/config && /generate-name-mapping.sh > {{.Dir}}/ds.patch`, data)
 		if err != nil {
 			panic(err.Error())
 		}
+		fmt.Printf("[%s]读取ds.patch\n", name)
 		data.DsData, err = ioutil.ReadFile(filepath.Join(data.Dir, "ds.patch"))
 		if err != nil {
 			panic(err.Error())
 		}
+		fmt.Printf("[%s]读取clustermesh.yaml\n", name)
 		clustermeshData, err := ioutil.ReadFile(filepath.Join(data.Dir, "clustermesh.yaml"))
 		if err != nil {
 			panic(err.Error())
@@ -131,6 +187,9 @@ func main() {
 	//合并clustermesh.yaml
 	secret := mergeSecret(clusters)
 	patch := mergePatch(clusters)
+	fmt.Println("patch:======================")
+	//fmt.Println(string(patch))
+	fmt.Println("patch:======================")
 	//在集群循环执行
 	for _, cluster := range clusters {
 		forCluster, err := getClientForCluster(cluster.KubeConfigPath)
@@ -138,16 +197,38 @@ func main() {
 			panic(err.Error())
 		}
 		//kubectl -n kube-system patch ds cilium -p "$(cat ds.patch)"
-		_, err = forCluster.AppsV1().DaemonSets(namespace).Patch(ciliumDsName, types.StrategicMergePatchType, patch)
+		fmt.Printf("[%s]更新DaemonSet\n", cluster.Name)
+		//_, err = forCluster.AppsV1().DaemonSets(namespace).Patch(ciliumDsName, types.StrategicMergePatchType, patch)
+		ciliumDs, err := forCluster.AppsV1().DaemonSets(namespace).Get(ciliumDsName, v12.GetOptions{})
 		if err != nil {
 			println(err.Error())
 		}
+
+		aliases := make([]v13.HostAlias, len(patch))
+		for i, aliase := range patch {
+			aliases[i] = v13.HostAlias{
+				IP:        aliase.Ip,
+				Hostnames: aliase.Hostnames,
+			}
+		}
+		ciliumDs.Spec.Template.Spec.HostAliases = aliases
+		for _, alias := range ciliumDs.Spec.Template.Spec.HostAliases {
+			fmt.Println(alias.IP, alias.Hostnames)
+		}
+		_, err = forCluster.AppsV1().DaemonSets(namespace).Update(ciliumDs)
+		if err != nil {
+			println(err.Error())
+		}
+
+		fmt.Printf("[%s]创建secret\n", cluster.Name)
 		//kubectl -n kube-system apply -f clustermesh.yaml
 		_, err = forCluster.CoreV1().Secrets(namespace).Create(secret)
 		if err != nil {
 			panic(err.Error())
 		}
 
+		//TODO:目前重启方式并不优雅
+		fmt.Printf("[%s]获取pod,并重启\n", cluster.Name)
 		//kubectl -n kube-system delete pod -l k8s-app=cilium
 		ciliumList, err := forCluster.CoreV1().Pods(namespace).List(v12.ListOptions{
 			LabelSelector: "k8s-app=cilium",
@@ -156,6 +237,7 @@ func main() {
 			panic(err.Error())
 		}
 		for _, item := range ciliumList.Items {
+			fmt.Println()
 			_ = forCluster.CoreV1().Pods(namespace).Delete(item.Name, &v12.DeleteOptions{})
 		}
 
@@ -169,9 +251,9 @@ func main() {
 		for _, item := range operatorList.Items {
 			_ = forCluster.CoreV1().Pods(namespace).Delete(item.Name, &v12.DeleteOptions{})
 		}
-	}
 
-	//ClusterRest()
+		//输出集群状态 kubectl -n kube-system exec -ti cilium-g6btl -- cilium node list
+	}
 
 }
 
@@ -189,8 +271,8 @@ type DsData struct {
 	} `yaml:"spec,omitempty"`
 }
 
-func mergePatch(clusters []*clusterData) []byte {
-	result := &DsData{}
+func mergePatch(clusters []*clusterData) []hostAliase {
+	//result := &DsData{}
 	aliases := make([]hostAliase, len(clusters))
 
 	for i, cluster := range clusters {
@@ -200,12 +282,13 @@ func mergePatch(clusters []*clusterData) []byte {
 		}
 		aliases[i] = tmp.Spec.Template.Spec.HostAliases[0]
 	}
-	result.Spec.Template.Spec.HostAliases = aliases
-	marshal, err := yaml.Marshal(result)
-	if err != nil {
-		panic(err.Error())
-	}
-	return marshal
+	//result.Spec.Template.Spec.HostAliases = aliases
+	//marshal, err := yaml.Marshal(result)
+	//if err != nil {
+	//	panic(err.Error())
+	//}
+	//return marshal
+	return aliases
 }
 
 func getClientForCluster(kubeconfig string) (*kubernetes.Clientset, error) {
@@ -253,7 +336,7 @@ type clusterData struct {
 	Data           map[string]string `yaml:"data,omitempty"`
 }
 
-func ExecCommand(cmd string, data *clusterData, arg ...string) error {
+func ExecCommand(cmd string, data *clusterData) error {
 	parse, err := template.New("t").Parse(cmd)
 	if err != nil {
 		return err
@@ -264,16 +347,12 @@ func ExecCommand(cmd string, data *clusterData, arg ...string) error {
 		return err
 	}
 	targetCmd := buffer.String()
-	fmt.Println("执行命令:", targetCmd, "参数:", arg)
-	command := exec.Command(targetCmd, arg...)
+	fmt.Println("执行命令:", targetCmd)
+	command := exec.Command("/bin/sh", "-c", targetCmd)
 	command.Env = append(command.Env, "KUBECONFIG", data.KubeConfigPath)
-	command.Dir = data.Dir
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return err
-	}
-	fmt.Println("输出:", string(output))
-	return nil
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	return command.Run()
 }
 
 func ClusterRest() {
