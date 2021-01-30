@@ -3,17 +3,13 @@ package main
 import (
 	"bytes"
 	"fmt"
-	v1 "github.com/kok-stack/kok/api/v1"
 	"gopkg.in/yaml.v2"
 	"html/template"
 	"io/ioutil"
 	v13 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	v12 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"os"
 	"os/exec"
@@ -105,7 +101,7 @@ func main() {
 				}
 			}
 			cm.Data["cluster-name"] = name
-			cm.Data["cluster-id"] = strconv.Itoa(i+1)
+			cm.Data["cluster-id"] = strconv.Itoa(i + 1)
 
 			fmt.Printf("[%s]更新configmap\n", name)
 			_, err = client.CoreV1().ConfigMaps(namespace).Update(cm)
@@ -185,7 +181,6 @@ func main() {
 		clusters[i] = data
 	}
 	//合并clustermesh.yaml
-	secret := mergeSecret(clusters)
 	patch := mergePatch(clusters)
 	//在集群循环执行
 	for _, cluster := range clusters {
@@ -195,7 +190,6 @@ func main() {
 		}
 		//kubectl -n kube-system patch ds cilium -p "$(cat ds.patch)"
 		fmt.Printf("[%s]更新DaemonSet\n", cluster.Name)
-		//_, err = forCluster.AppsV1().DaemonSets(namespace).Patch(ciliumDsName, types.StrategicMergePatchType, patch)
 		ciliumDs, err := forCluster.AppsV1().DaemonSets(namespace).Get(ciliumDsName, v12.GetOptions{})
 		if err != nil {
 			println(err.Error())
@@ -219,13 +213,12 @@ func main() {
 
 		fmt.Printf("[%s]创建secret\n", cluster.Name)
 		//kubectl -n kube-system apply -f clustermesh.yaml
-		//todo:移除自身secret
+		secret := mergeSecret(clusters, cluster.Name)
 		_, err = forCluster.CoreV1().Secrets(namespace).Create(secret)
 		if err != nil {
 			panic(err.Error())
 		}
 
-		//TODO:目前重启方式并不优雅
 		fmt.Printf("[%s]获取pod,并重启\n", cluster.Name)
 		//kubectl -n kube-system delete pod -l k8s-app=cilium
 		ciliumList, err := forCluster.CoreV1().Pods(namespace).List(v12.ListOptions{
@@ -235,7 +228,7 @@ func main() {
 			panic(err.Error())
 		}
 		for _, item := range ciliumList.Items {
-			fmt.Println("删除pod",item.Name)
+			fmt.Println("删除pod", item.Name)
 			_ = forCluster.CoreV1().Pods(namespace).Delete(item.Name, &v12.DeleteOptions{})
 		}
 
@@ -247,11 +240,30 @@ func main() {
 			panic(err.Error())
 		}
 		for _, item := range operatorList.Items {
-			fmt.Println("删除pod",item.Name)
+			fmt.Println("删除pod", item.Name)
 			_ = forCluster.CoreV1().Pods(namespace).Delete(item.Name, &v12.DeleteOptions{})
 		}
 
 		//输出集群状态 kubectl -n kube-system exec -ti cilium-g6btl -- cilium node list
+		var podName string
+		for i := 0; i < 100; i++ {
+			time.Sleep(time.Second * 1)
+			ciliumList, err = forCluster.CoreV1().Pods(namespace).List(v12.ListOptions{
+				LabelSelector: "k8s-app=cilium",
+			})
+			if err != nil {
+				panic(err.Error())
+			}
+			if len(ciliumList.Items) > 0 {
+				podName = ciliumList.Items[0].Name
+				break
+			}
+		}
+		if podName != "" {
+			_ = ExecCommand("kubectl --kubeconfig={{.KubeConfigPath}} exec -t -n kube-system "+podName+" -- cilium node list", cluster)
+		} else {
+			fmt.Println("未获取到pod，请手动运行命令查看状态：kubectl exec -t -n kube-system 容器名称 -- cilium node list")
+		}
 	}
 
 }
@@ -271,7 +283,6 @@ type DsData struct {
 }
 
 func mergePatch(clusters []*clusterData) []hostAliase {
-	//result := &DsData{}
 	aliases := make([]hostAliase, len(clusters))
 
 	for i, cluster := range clusters {
@@ -281,12 +292,6 @@ func mergePatch(clusters []*clusterData) []hostAliase {
 		}
 		aliases[i] = tmp.Spec.Template.Spec.HostAliases[0]
 	}
-	//result.Spec.Template.Spec.HostAliases = aliases
-	//marshal, err := yaml.Marshal(result)
-	//if err != nil {
-	//	panic(err.Error())
-	//}
-	//return marshal
 	return aliases
 }
 
@@ -310,7 +315,7 @@ func getClientForCluster(kubeconfig string) (*kubernetes.Clientset, error) {
 	return client, nil
 }
 
-func mergeSecret(clusters []*clusterData) *v13.Secret {
+func mergeSecret(clusters []*clusterData, excludeName string) *v13.Secret {
 	data := make(map[string][]byte)
 	secret := &v13.Secret{
 		ObjectMeta: v12.ObjectMeta{
@@ -320,6 +325,9 @@ func mergeSecret(clusters []*clusterData) *v13.Secret {
 		Data: data,
 	}
 	for _, cluster := range clusters {
+		if cluster.Name == excludeName {
+			continue
+		}
 		for s, s2 := range cluster.Data {
 			data[s] = []byte(s2)
 		}
@@ -352,36 +360,4 @@ func ExecCommand(cmd string, data *clusterData) error {
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	return command.Run()
-}
-
-func ClusterRest() {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	configOverrides := &clientcmd.ConfigOverrides{}
-
-	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
-	config, err := kubeConfig.ClientConfig()
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println("test...")
-	cluster := &v1.Cluster{}
-	config.APIPath = "/apis"
-	config.GroupVersion = &schema.GroupVersion{
-		Group:   "cluster.kok.tanx",
-		Version: "v1",
-	}
-	config.NegotiatedSerializer = scheme.Codecs
-	forConfig, err := rest.RESTClientFor(config)
-	if err != nil {
-		panic(err)
-	}
-	err = forConfig.Get().Namespace("test").Resource("clusters").Name("test").Do().Into(cluster)
-	if err != nil {
-		found := errors.IsNotFound(err)
-		fmt.Println("found:", found)
-		print(err)
-	}
-
-	fmt.Println(cluster.Status)
 }
