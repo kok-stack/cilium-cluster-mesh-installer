@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"gopkg.in/yaml.v2"
 	"html/template"
@@ -64,11 +65,11 @@ func main() {
 			panic(err.Error())
 		}
 
-		for i := 0; i < 1000; i++ {
+		for i := 0; i < 2000; i++ {
 			ciliumList, _ := client.CoreV1().Pods(namespace).List(v12.ListOptions{
 				LabelSelector: "k8s-app=cilium",
 			})
-			fmt.Printf("[%s][%v/1000]获取pod状态为", name, i)
+			fmt.Printf("[%s][%v/2000]获取pod状态为", name, i)
 			for _, item := range ciliumList.Items {
 				fmt.Print("pod:", item.Name, " ")
 
@@ -81,7 +82,7 @@ func main() {
 				}
 			}
 			fmt.Println("")
-			fmt.Printf("[%s][%v/1000]获取pod状态,未ready,等待1s重试\n", name, i)
+			fmt.Printf("[%s][%v/2000]获取pod状态,未ready,等待1s重试\n", name, i)
 			time.Sleep(time.Second)
 		}
 	label1:
@@ -107,6 +108,8 @@ func main() {
 			_, err = client.CoreV1().ConfigMaps(namespace).Update(cm)
 			if err != nil {
 				panic(err.Error())
+			} else {
+				fmt.Printf("[%s]已更新configmap(%s),cluster-id:%s,cluster-name:%s \n", name, cmName, cm.Data["cluster-id"], cm.Data["cluster-name"])
 			}
 			break
 		}
@@ -181,6 +184,7 @@ func main() {
 		clusters[i] = data
 	}
 	//合并clustermesh.yaml
+	secret := mergeSecret(clusters)
 	patch := mergePatch(clusters)
 	//在集群循环执行
 	for _, cluster := range clusters {
@@ -213,12 +217,12 @@ func main() {
 
 		fmt.Printf("[%s]创建secret\n", cluster.Name)
 		//kubectl -n kube-system apply -f clustermesh.yaml
-		secret := mergeSecret(clusters, cluster.Name)
 		_, err = forCluster.CoreV1().Secrets(namespace).Create(secret)
 		if err != nil {
 			panic(err.Error())
 		}
 
+		time.Sleep(time.Second * 10)
 		fmt.Printf("[%s]获取pod,并重启\n", cluster.Name)
 		//kubectl -n kube-system delete pod -l k8s-app=cilium
 		ciliumList, err := forCluster.CoreV1().Pods(namespace).List(v12.ListOptions{
@@ -244,16 +248,14 @@ func main() {
 			_ = forCluster.CoreV1().Pods(namespace).Delete(item.Name, &v12.DeleteOptions{})
 		}
 
+		time.Sleep(time.Second * 5)
 		//输出集群状态 kubectl -n kube-system exec -ti cilium-g6btl -- cilium node list
 		var podName string
 		for i := 0; i < 100; i++ {
 			time.Sleep(time.Second * 1)
-			ciliumList, err = forCluster.CoreV1().Pods(namespace).List(v12.ListOptions{
+			ciliumList, _ = forCluster.CoreV1().Pods(namespace).List(v12.ListOptions{
 				LabelSelector: "k8s-app=cilium",
 			})
-			if err != nil {
-				panic(err.Error())
-			}
 			if len(ciliumList.Items) > 0 {
 				podName = ciliumList.Items[0].Name
 				break
@@ -315,7 +317,7 @@ func getClientForCluster(kubeconfig string) (*kubernetes.Clientset, error) {
 	return client, nil
 }
 
-func mergeSecret(clusters []*clusterData, excludeName string) *v13.Secret {
+func mergeSecret(clusters []*clusterData) *v13.Secret {
 	data := make(map[string][]byte)
 	secret := &v13.Secret{
 		ObjectMeta: v12.ObjectMeta{
@@ -325,11 +327,12 @@ func mergeSecret(clusters []*clusterData, excludeName string) *v13.Secret {
 		Data: data,
 	}
 	for _, cluster := range clusters {
-		if cluster.Name == excludeName {
-			continue
-		}
 		for s, s2 := range cluster.Data {
-			data[s] = []byte(s2)
+			decodeString, err := base64.StdEncoding.DecodeString(s2)
+			if err != nil {
+				panic(err.Error())
+			}
+			data[s] = decodeString
 		}
 	}
 	return secret
