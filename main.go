@@ -23,8 +23,8 @@ import (
 /etc/clusters/a/config
 */
 const namespace = "kube-system"
-const clusterDir = "/etc/clusters"
-const configName = "kube-config"
+const clusterDir = "/etc/cluster"
+const configName = "config"
 const ciliumDsName = "cilium"
 
 func main() {
