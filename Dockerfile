@@ -22,8 +22,9 @@ WORKDIR /
 COPY --from=builder /workspace/main .
 #helm , cilium , chmod 777
 RUN wget -o helm.tar.gz https://get.helm.sh/helm-v3.5.2-linux-arm.tar.gz && tar -zxvf helm.tar.gz && mv linux-amd64/helm /usr/local/bin/helm
-ADD extract-etcd-secrets.sh .
-ADD generate-name-mapping.sh .
-ADD generate-secret-yaml.sh .
+ADD extract-etcd-secrets.sh /
+ADD generate-name-mapping.sh /
+ADD generate-secret-yaml.sh /
+RUN chmod 777 /*.sh
 
 CMD ["./main"]
