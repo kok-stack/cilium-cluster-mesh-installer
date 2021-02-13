@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,12 +33,17 @@ func main() {
 	if err != nil {
 		panic(err.Error())
 	}
-	clusters := make([]*clusterData, len(files))
-	for i, file := range files {
-		if !file.IsDir() {
+	clusters := make([]*clusterData, 0)
+	for _, file := range files {
+		name := file.Name()
+		//if !file.IsDir() {
+		//	fmt.Printf("%s不是文件夹，跳过此文件 \n", name)
+		//	continue
+		//}
+		if strings.HasPrefix(name, "..") {
+			fmt.Printf("%s以..开头，跳过此文件夹 \n", name)
 			continue
 		}
-		name := file.Name()
 		fmt.Printf("[%s]开始安装\n", name)
 		kubeconfig := filepath.Join(clusterDir, name, configName)
 		data := &clusterData{
@@ -90,7 +96,7 @@ func main() {
 		//编辑cm cilium-config
 		fmt.Printf("[%s]获取configmap\n", name)
 		cmName := "cilium-config"
-		for index := 0; i < 10; i++ {
+		for index := 0; index < 10; index++ {
 			cm, err := client.CoreV1().ConfigMaps(namespace).Get(cmName, v12.GetOptions{})
 			if err != nil {
 				if errors.IsNotFound(err) {
@@ -102,7 +108,7 @@ func main() {
 				}
 			}
 			cm.Data["cluster-name"] = name
-			cm.Data["cluster-id"] = strconv.Itoa(i + 1)
+			cm.Data["cluster-id"] = strconv.Itoa(index + 1)
 
 			fmt.Printf("[%s]更新configmap\n", name)
 			_, err = client.CoreV1().ConfigMaps(namespace).Update(cm)
@@ -181,7 +187,7 @@ func main() {
 			panic(err.Error())
 		}
 		//得到ds.patch和 clustermesh.yaml
-		clusters[i] = data
+		clusters = append(clusters, data)
 	}
 	//合并clustermesh.yaml
 	secret := mergeSecret(clusters)
